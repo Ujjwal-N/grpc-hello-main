@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+//option java_multiple_files = true;
+//option java_package = "edu.sjsu.cs185c.grpcHello";
+//option java_outer_classname = "Hello";
+
+package edu.sjsu.cs158c.grpcHello;
+
+service HelloService {
+   rpc hello(HelloRequest) returns (HelloResponse) {}
+}
+
+message HelloRequest {
+    string name = 1;
+    string code = 2;
+}
+
+message HelloResponse {
+    sint32 rc = 1;
+    string message = 2;
+}

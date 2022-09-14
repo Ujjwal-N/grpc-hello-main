@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package edu.sjsu.cs185c.didyousee;
+
+service WhosHere {
+   // exchange gossip information
+   rpc gossip(GossipRequest) returns (GossipResponse) {}
+   // used for debugging purposes
+   rpc whoareyou(WhoRequest) returns (WhoResponse) {}
+}
+
+message GossipRequest {
+    // info on all the hosts that the process knows about, including
+    // itself.
+    repeated GossipInfo info = 1;
+}
+
+message GossipResponse {
+    // 0 => success
+    sint32 rc = 1;
+    repeated GossipInfo info = 2;
+}
+
+message GossipInfo {
+    // human readable name
+    string name = 1;
+    // has the form host:port
+    string hostPort = 2;
+    int32 epoch = 3;
+}
+
+message WhoRequest {
+}
+
+message WhoResponse {
+    string name = 1;
+    repeated GossipInfo info = 2;
+}
