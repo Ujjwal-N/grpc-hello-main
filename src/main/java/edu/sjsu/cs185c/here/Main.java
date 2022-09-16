@@ -25,9 +25,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 
 public class Main {
 
-    // used as identifiers in various parts of the code
+    // used as an identifier in various parts of the code
     static String myName;
-    static GossipInfo selfInfo;
 
     // threadsafe list that tracks all the GossipInfo in a given request
     static CopyOnWriteArrayList<GossipInfo> sortedList;
@@ -50,8 +49,8 @@ public class Main {
         boolean setOne;
 
         static int epoch;
-        boolean firstRequestSent = false;
 
+        static GossipInfo selfInfo;
         @Override
         public Integer call() throws Exception {
             // Some initial setup
@@ -62,6 +61,15 @@ public class Main {
             sortedList = new CopyOnWriteArrayList<GossipInfo>();
 
             String myAddress = address + ":" + Integer.toString(port);
+
+            selfInfo = GossipInfo.newBuilder().setName(name).setHostPort(myAddress).setEpoch(epoch).build(); // to update epoch
+            sortedList.add(selfInfo);
+            for(String cAddress : neighborAddress){
+                GossipInfo currentInfo = GossipInfo.newBuilder().setName("").setHostPort(cAddress).setEpoch(0).build(); 
+                sortedList.add(currentInfo);
+            }
+
+            Collections.sort(sortedList, new SortByHosts());
 
             // Will be triggered every 5 seconds
             TimerTask task = new TimerTask() {
@@ -93,17 +101,8 @@ public class Main {
                     if (myIndex != -1) {
                         sortedList.remove(myIndex); // removes current node from list, if it exists
                     }
-                    sortedList.add(selfInfo); // adds back current node with new epoch
+                    sortedList.add(selfInfo); // adds back current node with new epoch  
                     Collections.sort(sortedList, new SortByHosts()); // sorts list to print
-
-                    ArrayList<String> hostAddresses = new ArrayList<String>();
-                    if (epoch == 1 && !firstRequestSent) { // if it is the parent server, its important to ensure
-                                                           // hostAddresses from commandline are added
-                        for (int i = 0; i < neighborAddress.length; i++) {
-                            hostAddresses.add(neighborAddress[i]);
-                        }
-                        firstRequestSent = true;
-                    }
 
                     System.out.println("=======");
 
@@ -111,24 +110,21 @@ public class Main {
                     GrpcGossip.GossipRequest.Builder currentBuilder = GossipRequest.newBuilder();
                     int index = 0;
                     for (GossipInfo info : sortedList) {
+                         if (info.getName().equals(selfInfo.getName())) {
+                            myIndex = index;
+                        }
                         currentBuilder.addInfo(info);
                         System.out.println(info.getEpoch() + " " + info.getHostPort() + " " + info.getName());
-                        if (!hostAddresses.contains(info.getHostPort())) {
-                            hostAddresses.add(info.getHostPort());
-                        }
                         index += 1;
                     }
                     GossipRequest currentRequest = currentBuilder.build();
 
-                    Collections.sort(hostAddresses);
-                    myIndex = hostAddresses.indexOf(myAddress);
-
-                    int total = hostAddresses.size();
+                    int total = sortedList.size();
                     index = (myIndex + 1) % total;
                     int numSuccesses = 0;
                     while (numSuccesses < 2 && index != myIndex) {
                         try {
-                            var channel = ManagedChannelBuilder.forTarget(hostAddresses.get(index))
+                            var channel = ManagedChannelBuilder.forTarget(sortedList.get(index).getHostPort())
                                     .usePlaintext()
                                     .build();
                             var stub = WhosHereGrpc.newFutureStub(channel);
@@ -139,7 +135,6 @@ public class Main {
                             epoch += 1;
                         }
                         index = (index + 1) % total;
-
                     }
 
                 }
@@ -175,7 +170,7 @@ public class Main {
                         break;
                     }
                 }
-                if (!found) {
+                if(!found){
                     sortedList.add(info);
                 }
             }
