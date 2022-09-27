@@ -97,8 +97,8 @@ public class Main {
                     Collections.sort(sortedList, new SortByHosts()); // sorts list to print
 
                     ArrayList<String> hostAddresses = new ArrayList<String>();
-                    if (epoch == 1 && !firstRequestSent) { // if it is the parent server, its important to ensure
-                                                           // hostAddresses from commandline are added
+                    if (setOne) { // if it is the parent server, its important to ensure
+                                  // hostAddresses from commandline are added
                         for (int i = 0; i < neighborAddress.length; i++) {
                             hostAddresses.add(neighborAddress[i]);
                         }
