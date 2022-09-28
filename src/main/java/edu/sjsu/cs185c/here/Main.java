@@ -9,28 +9,40 @@ import edu.sjsu.cs185c.didyousee.GrpcGossip.WhoResponse;
 import edu.sjsu.cs185c.didyousee.WhosHereGrpc.WhosHereImplBase;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.ServerBuilder;
+import io.grpc.StatusRuntimeException;
 import io.grpc.stub.StreamObserver;
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 import picocli.CommandLine.Parameters;
 
+import java.net.InetAddress;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class Main {
 
-    // used as identifiers in various parts of the code
-    static String myName;
-    static GossipInfo selfInfo;
+    // Server thread manages incoming requests, updates epoch, workingList, and
+    // knownAddresses
+    // Client thread initializes all static variables, updates selfInfo, and sends
+    // outgoing requests
 
-    // threadsafe list that tracks all the GossipInfo in a given request
-    static CopyOnWriteArrayList<GossipInfo> sortedList;
+    // initialized by client thread, changed by server thread as time goes on
+    static AtomicInteger epoch; // both threads read and write
+    static GossipInfo.Builder selfInfo; // client thread reads and writes, server thread reads
+
+    // threadsafe lists that track information recieved by servers
+    static CopyOnWriteArrayList<GossipInfo> workingList; // server thread reads and writes, client thread reads, will
+                                                         // NOT have selfinfo
+    static CopyOnWriteArrayList<String> knownAddresses; // server thread reads and writes, client thread reads, will NOT
+                                                        // have self hostport
 
     @Command(name = "gossip", mixinStandardHelpOptions = true)
     static class Cli implements Callable<Integer> {
@@ -49,19 +61,21 @@ public class Main {
         @Option(names = { "-e" }, description = "sets epoch to 1")
         boolean setOne;
 
-        static int epoch;
-        boolean firstRequestSent = false;
-
         @Override
         public Integer call() throws Exception {
             // Some initial setup
-            myName = name;
-            if (setOne) {
-                epoch = 1;
-            }
-            sortedList = new CopyOnWriteArrayList<GossipInfo>();
+            epoch = setOne ? new AtomicInteger(1) : new AtomicInteger(0);
 
             String myAddress = address + ":" + Integer.toString(port);
+            selfInfo = GossipInfo.newBuilder().setName(name).setHostPort(myAddress)
+                    .setEpoch(epoch.get());
+
+            workingList = new CopyOnWriteArrayList<GossipInfo>();
+            knownAddresses = new CopyOnWriteArrayList<String>();
+
+            for (String element : neighborAddress) {
+                knownAddresses.add(element);
+            }
 
             // Will be triggered every 5 seconds
             TimerTask task = new TimerTask() {
@@ -69,75 +83,48 @@ public class Main {
                 @Override
                 public void run() {
 
-                    int myIndex = -1; // represents the index of the current node
+                    // updating selfinfo with new epoch
+                    selfInfo.setEpoch(epoch.get());
 
-                    for (int i = 0; i < sortedList.size(); i++) { // recalculates epoch based on current information
-                        GossipInfo info = sortedList.get(i);
+                    ArrayList<GossipInfo> localWorkingList = new ArrayList<GossipInfo>(workingList);
+                    localWorkingList.add(selfInfo.build());
+                    Collections.sort(localWorkingList, new SortByHosts());
 
-                        if (info.getHostPort().equals(selfInfo.getHostPort())) {
-                            myIndex = i;
-                            continue;
-                        }
-                        int otherEpoch = info.getEpoch();
-                        if (otherEpoch > epoch) {
-                            epoch = otherEpoch;
-                        } else if (otherEpoch == 0) {
-                            epoch += 1;
-                        }
-                    }
-
-                    selfInfo = GossipInfo.newBuilder().setName(name).setHostPort(myAddress)
-                            .setEpoch(epoch)
-                            .build(); // to update epoch
-
-                    if (myIndex != -1) {
-                        sortedList.remove(myIndex); // removes current node from list, if it exists
-                    }
-                    sortedList.add(selfInfo); // adds back current node with new epoch
-                    Collections.sort(sortedList, new SortByHosts()); // sorts list to print
-
-                    ArrayList<String> hostAddresses = new ArrayList<String>();
-                    if (setOne) { // if it is the parent server, its important to ensure
-                                  // hostAddresses from commandline are added
-                        for (int i = 0; i < neighborAddress.length; i++) {
-                            hostAddresses.add(neighborAddress[i]);
-                        }
-                        firstRequestSent = true;
-                    }
-
+                    // printing current list and building request
                     System.out.println("=======");
-
-                    // Building request and populating addresses
                     GrpcGossip.GossipRequest.Builder currentBuilder = GossipRequest.newBuilder();
                     int index = 0;
-                    for (GossipInfo info : sortedList) {
+                    for (GossipInfo info : localWorkingList) {
                         currentBuilder.addInfo(info);
                         System.out.println(info.getEpoch() + " " + info.getHostPort() + " " + info.getName());
-                        if (!hostAddresses.contains(info.getHostPort())) {
-                            hostAddresses.add(info.getHostPort());
-                        }
-                        index += 1;
                     }
                     GossipRequest currentRequest = currentBuilder.build();
 
-                    Collections.sort(hostAddresses);
-                    myIndex = hostAddresses.indexOf(myAddress);
+                    // contacting the hostports
+                    ArrayList<String> localKnownAddresses = new ArrayList<String>(knownAddresses);
+                    localKnownAddresses.add(myAddress);
+                    Collections.sort(localKnownAddresses);
 
-                    int total = hostAddresses.size();
+                    int myIndex = localKnownAddresses.indexOf(myAddress);
+                    int total = localKnownAddresses.size();
                     index = (myIndex + 1) % total;
                     int numSuccesses = 0;
-                    while (numSuccesses < 2 && index != myIndex) {
+                    while (numSuccesses < 2) {
+                        if (index == myIndex) { // cycled entire list
+                            break;
+                        }
+                        var channel = ManagedChannelBuilder.forTarget(localKnownAddresses.get(index))
+                                .usePlaintext()
+                                .build();
+                        var stub = WhosHereGrpc.newBlockingStub(channel);
                         try {
-                            var channel = ManagedChannelBuilder.forTarget(hostAddresses.get(index))
-                                    .usePlaintext()
-                                    .build();
-                            var stub = WhosHereGrpc.newFutureStub(channel);
                             stub.gossip(currentRequest);
                             channel.shutdown();
                             numSuccesses += 1;
                         } catch (Exception e) {
-                            epoch += 1;
+                            epoch.set(epoch.get() + 1);
                         }
+                        channel.shutdown();
                         index = (index + 1) % total;
 
                     }
@@ -164,32 +151,105 @@ public class Main {
     }
 
     static class WhosHereImpl extends WhosHereImplBase {
+
         @Override
         public void gossip(GossipRequest request, StreamObserver<GossipResponse> responseObserver) {
-            for (GossipInfo info : request.getInfoList()) {
-                boolean found = false;
-                for (var i = 0; i < sortedList.size(); i++) {
-                    if (info.getName().equals(sortedList.get(i).getName())) {
-                        sortedList.set(i, info);
-                        found = true;
+            // Updating working list based on current responses.
+            ArrayList<GossipInfo> localWorkingList = new ArrayList<GossipInfo>(); // temporary store to avoid concurrent
+                                                                                  // modification errors
+
+            for (GossipInfo currentInfo : request.getInfoList()) {
+
+                // No need to process my own info, I track that myself
+                if (currentInfo.getHostPort().equals(selfInfo.getHostPort())) {
+                    continue;
+                }
+
+                // Updating epoch if necessary
+                if (currentInfo.getEpoch() > epoch.get()) {
+                    epoch.set(currentInfo.getEpoch());
+                }
+
+                // handling possible overwrite
+                if (knownAddresses.contains(currentInfo.getHostPort())) {
+
+                    boolean found = false;
+                    GossipInfo oldInfo = null;
+
+                    for (GossipInfo element : workingList) {
+                        if (element.getHostPort().equals(currentInfo.getHostPort())) {
+                            oldInfo = element;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        localWorkingList.add(currentInfo);
+                    } else {
+                        if (oldInfo.getEpoch() < currentInfo.getEpoch()) {
+                            localWorkingList.add(currentInfo);
+                        } else {
+                            localWorkingList.add(oldInfo);
+                        }
+                    }
+
+                } else {
+                    // new person found
+                    knownAddresses.add(currentInfo.getHostPort());
+                    localWorkingList.add(currentInfo);
+                }
+            }
+
+            // Ensuring that servers not included in the current response are also reflected
+            // on the new gossip
+            for (GossipInfo oldInfo : workingList) {
+                boolean contains = false;
+                for (GossipInfo newInfo : localWorkingList) {
+                    if (oldInfo.getHostPort().equals(newInfo.getHostPort())) {
+                        contains = true;
                         break;
                     }
                 }
-                if (!found) {
-                    sortedList.add(info);
+                if (!contains) {
+                    localWorkingList.add(oldInfo);
                 }
             }
+
+            workingList.clear();
+            workingList.addAll(localWorkingList); // saving the processing
+
+            // updating selfinfo with new epoch, adding self to list
+            selfInfo.setEpoch(epoch.get());
+
+            localWorkingList.add(selfInfo.build());
+            Collections.sort(localWorkingList, new SortByHosts());
+
+            // building response
+            GrpcGossip.GossipResponse.Builder currentBuilder = GossipResponse.newBuilder();
+            currentBuilder.addAllInfo(localWorkingList);
+            responseObserver.onNext(currentBuilder.build());
+            responseObserver.onCompleted();
 
         }
 
         @Override
         public void whoareyou(WhoRequest request, StreamObserver<WhoResponse> responseObserver) {
-            WhoResponse.Builder builder = WhoResponse.newBuilder().setName(myName);
-            for (GossipInfo info : sortedList) {
+            WhoResponse.Builder builder = WhoResponse.newBuilder().setName(selfInfo.getName());
+            ArrayList<GossipInfo> localWorkingList = new ArrayList<GossipInfo>(workingList);
+            localWorkingList.add(selfInfo.build());
+            Collections.sort(localWorkingList, new SortByHosts());
+            for (GossipInfo info : workingList) {
                 builder.addInfo(info);
             }
             responseObserver.onNext(builder.build());
             responseObserver.onCompleted();
+        }
+
+        class SortByHosts implements Comparator<GossipInfo> {
+            // Used for sorting in ascending order of ID
+            public int compare(GossipInfo a, GossipInfo b) {
+                return a.getHostPort().compareTo(b.getHostPort());
+            }
         }
 
     }
